@@ -132,6 +132,9 @@ function MainApp() {
     toggleMute,
     isDetectionActive,
     detectedCount,
+    isModelReady,
+    isModelLoading,
+    modelError,
     startDetection,
     stopDetection,
     setIsPaused: setTensorflowPaused,
@@ -199,6 +202,7 @@ function MainApp() {
 
           // Step 3: Speak description aloud via Single Unified AI Voice
           speak(answer, {
+            priority: 'high',
             onFinish: () => {
               isBusyRef.current = false;
               if (isDetectionActive) setTensorflowPaused(false);
@@ -213,14 +217,18 @@ function MainApp() {
       } catch (err) {
         if (err.name === 'AbortError') {
           console.log('[AURA AI] Vision analysis aborted by user barge-in.');
+          isBusyRef.current = false;
+          if (isDetectionActive) setTensorflowPaused(false);
+          setStatusText('Listening hands-free. Say "Hey Aura" anytime.');
           return;
         }
         console.error('Vision analysis error:', err);
         const errMsg = isHindi
-          ? 'विश्लेषण नहीं हो सका। कृपया दोबारा पूछें।'
-          : 'Could not complete analysis. Please ask again.';
+          ? `विश्लेषण नहीं हो सका। ${err.message || 'कृपया दोबारा पूछें।'}`
+          : (err.message || 'Could not complete analysis. Please try again.');
         setStatusText(errMsg);
         speak(errMsg, {
+          priority: 'high',
           onFinish: () => {
             isBusyRef.current = false;
             if (isDetectionActive) setTensorflowPaused(false);
@@ -327,6 +335,7 @@ function MainApp() {
       if (e.code === 'Space') {
         e.preventDefault();
         // Spacebar triggers listen mode to speak to Aura
+        unlockMic();
         triggerListenNow();
         setStatusText('Listening to you… Speak now');
         playTone(880, 0.08);
@@ -348,7 +357,7 @@ function MainApp() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [runVisionAnalysis, toggleMute, stopSpeaking, abortAnalysis, unlockAudio, triggerListenNow, playTone]);
+  }, [runVisionAnalysis, toggleMute, stopSpeaking, abortAnalysis, unlockAudio, unlockMic, triggerListenNow, playTone]);
 
   /* Camera Initialization */
   useEffect(() => {
@@ -373,15 +382,19 @@ function MainApp() {
         speak(
           isHindi
             ? 'ऑरा सक्रिय है। पूछिए क्या देखना है, या बोलें नोट चेक करो।'
-            : 'Aura is listening. Ask what is ahead, check money, or turn alert on.'
+            : 'Aura is listening. Obstacle alerts are on. Ask what is ahead or check money.'
         );
+        // The first deliberate tap unlocks Web Audio on browsers and enables
+        // local obstacle alerts immediately; camera detection remains local.
+        startDetection();
+        setStatusText('Obstacle alerts active');
         triggerListenNow();
       } else {
         setStatusText('Listening to you… Speak now');
         triggerListenNow();
       }
     },
-    [unlockAudio, unlockMic, hasActivated, activeLang, speak, playTone, triggerListenNow]
+    [unlockAudio, unlockMic, hasActivated, activeLang, speak, playTone, triggerListenNow, startDetection]
   );
 
   return (
@@ -463,14 +476,19 @@ function MainApp() {
           </h1>
           <p className="aura-sub-caption">
             {!hasActivated
-              ? 'Tap screen once to enable voice assistant'
+              ? 'Tap screen once to activate Aura and obstacle alerts'
               : isDetectionActive
               ? `Radar active (${detectedCount} obstacle${detectedCount === 1 ? '' : 's'} in view) • Say "Stop detection" to pause`
-              : 'Say "Alert on" to start camera detection • "Check money" • "What\'s ahead"'}
+              : isModelLoading
+              ? 'Loading local obstacle recognition…'
+              : !isModelReady
+              ? 'Obstacle recognition is unavailable'
+              : 'Tap to activate local obstacle alerts • "Check money" • "What\'s ahead"'}
           </p>
         </div>
 
         {/* Error notices */}
+        {modelError && <div className="notice-banner" role="alert">{modelError}</div>}
         {cameraError && <div className="notice-banner" role="alert">{cameraError}</div>}
         {micNotice && <div className="notice-banner" role="alert">{micNotice}</div>}
       </main>
@@ -479,6 +497,9 @@ function MainApp() {
       <footer className="aura-footer">
         <span className="footer-voice-hint">
           {!hasActivated ? '👉 Tap anywhere to activate audio' : '🎤 Tap circle or say "Hey Aura" to speak'}
+        </span>
+        <span className="footer-voice-hint">
+          Cloud scans send one snapshot to your configured AI provider. OpenRouter’s free model may log uploads; avoid sensitive images.
         </span>
         <div className="footer-links">
           <a href="#terms">Terms</a>

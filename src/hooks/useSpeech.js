@@ -146,8 +146,9 @@ export function useSpeech(callbacks = {}) {
   const wakeDebounceTimerRef = useRef(null);
   const activeWindowTimerRef = useRef(null);
 
-  // Single unified audio player (ONE consistent AI voice throughout)
-  const singleAudioRef = useRef(null);
+  // Use the browser speech engine locally. This removes a remote TTS round trip
+  // from every spoken response and keeps output independent of server load.
+  const speechTimerRef = useRef(null);
   const audioQueueRef = useRef([]);
   const isPlayingQueueRef = useRef(false);
 
@@ -171,6 +172,7 @@ export function useSpeech(callbacks = {}) {
   const isSpeakingRef = useRef(false);
   const isRecognitionActiveRef = useRef(false);
   const isStartingRef = useRef(false);
+  const recognitionBlockedRef = useRef(false);
   const isAuraAwakeRef = useRef(false);
   const isListeningPromptRef = useRef(false);
   const activeLangRef = useRef('en-US');
@@ -186,24 +188,12 @@ export function useSpeech(callbacks = {}) {
     activeLangRef.current = activeLang;
   }, [activeLang]);
 
-  // Lazy initialize single audio element
-  useEffect(() => {
-    if (typeof window !== 'undefined' && !singleAudioRef.current) {
-      singleAudioRef.current = new Audio();
-    }
-  }, []);
-
   /* ================================================================
-     1. SINGLE UNIFIED AI VOICE (Google TTS Audio Stream /api/tts)
-     Only ONE natural voice is ever used — no robotic browser voice clashing
+     1. SINGLE LOCAL SPEECH QUEUE
      ================================================================ */
   const stopSpeaking = useCallback(() => {
-    if (singleAudioRef.current) {
-      try {
-        singleAudioRef.current.pause();
-        singleAudioRef.current.currentTime = 0;
-      } catch {}
-    }
+    if (speechTimerRef.current) clearTimeout(speechTimerRef.current);
+    try { window.speechSynthesis?.cancel(); } catch {}
     audioQueueRef.current = [];
     isPlayingQueueRef.current = false;
     isSpeakingRef.current = false;
@@ -213,75 +203,76 @@ export function useSpeech(callbacks = {}) {
 
   const speak = useCallback(
     (text, options = {}) => {
-      const { onFinish } = options;
+      const { onFinish, isUrgent = false, priority = 'normal' } = options;
       if (!text) {
         onFinish?.();
         return;
       }
 
-      // Stop any existing utterance
+      // Routine alerts never stack over speech. Urgent hazards and direct
+      // user-requested answers can interrupt the current message.
+      if (isSpeakingRef.current && !isUrgent && priority !== 'high') return;
       stopSpeaking();
 
       isSpeakingRef.current = true;
       setIsSpeaking(true);
       lastSpokenPhraseRef.current = text.toLowerCase().trim();
 
-      const targetLang = detectLanguage(text);
-      const isHindi = targetLang.startsWith('hi');
+      const detectedLang = detectLanguage(text);
+      const targetLang = detectedLang === 'en-US' ? activeLangRef.current : detectedLang;
       const chunks = splitIntoSentences(text);
       audioQueueRef.current = [...chunks];
       isPlayingQueueRef.current = true;
 
-      // Safety watchdog timer in case browser stalls audio events
-      const totalWords = text.split(/\s+/).length;
-      const maxDurationMs = Math.max(3000, totalWords * 600);
-      const watchdog = setTimeout(() => {
-        if (isSpeakingRef.current) {
-          isSpeakingRef.current = false;
-          setIsSpeaking(false);
-          isPlayingQueueRef.current = false;
-          onFinish?.();
-        }
-      }, maxDurationMs);
+      if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+        isSpeakingRef.current = false;
+        isPlayingQueueRef.current = false;
+        setIsSpeaking(false);
+        setMicNotice('Speech output is unavailable in this browser.');
+        onFinish?.();
+        return;
+      }
+
+      const finish = () => {
+        if (speechTimerRef.current) clearTimeout(speechTimerRef.current);
+        speechTimerRef.current = null;
+        isSpeakingRef.current = false;
+        setIsSpeaking(false);
+        isPlayingQueueRef.current = false;
+        onFinish?.();
+      };
 
       const playNextChunk = () => {
         if (!isPlayingQueueRef.current) {
-          clearTimeout(watchdog);
           return;
         }
 
         if (audioQueueRef.current.length === 0) {
-          clearTimeout(watchdog);
-          isSpeakingRef.current = false;
-          setIsSpeaking(false);
-          isPlayingQueueRef.current = false;
-          onFinish?.();
+          finish();
           return;
         }
 
-        const nextText = audioQueueRef.current.shift();
-        const ttsUrl = `/api/tts?lang=${isHindi ? 'hi' : 'en'}&text=${encodeURIComponent(nextText)}`;
-
-        if (!singleAudioRef.current) {
-          singleAudioRef.current = new Audio();
+        const utterance = new SpeechSynthesisUtterance(audioQueueRef.current.shift());
+        utterance.lang = targetLang;
+        utterance.rate = 0.98;
+        const voices = window.speechSynthesis.getVoices();
+        utterance.voice = voices.find((voice) => voice.lang.toLowerCase() === targetLang.toLowerCase()) ||
+          voices.find((voice) => voice.lang.toLowerCase().startsWith(targetLang.slice(0, 2).toLowerCase())) || null;
+        utterance.onstart = () => { isSpeakingRef.current = true; setIsSpeaking(true); };
+        utterance.onend = playNextChunk;
+        utterance.onerror = (event) => {
+          if (event.error === 'canceled' || event.error === 'interrupted') return;
+          playNextChunk();
+        };
+        speechTimerRef.current = setTimeout(() => {
+          window.speechSynthesis.cancel();
+          finish();
+        }, Math.max(15000, text.split(/\s+/).length * 700 + 7000));
+        try {
+          window.speechSynthesis.speak(utterance);
+        } catch {
+          playNextChunk();
         }
-
-        const audio = singleAudioRef.current;
-        audio.src = ttsUrl;
-
-        audio.onended = () => {
-          playNextChunk();
-        };
-
-        audio.onerror = () => {
-          console.warn('[AURA AI] TTS audio stream network error.');
-          playNextChunk();
-        };
-
-        audio.play().catch((err) => {
-          console.warn('[AURA AI] Audio play interrupted:', err.message);
-          playNextChunk();
-        });
       };
 
       playNextChunk();
@@ -293,6 +284,7 @@ export function useSpeech(callbacks = {}) {
      2. CONTINUOUS SPEECH RECOGNITION (Hands-Free + Direct Commands)
      ================================================================ */
   const startContinuousRecognition = useCallback(() => {
+    if (recognitionBlockedRef.current) return;
     if (restartTimerRef.current) {
       clearTimeout(restartTimerRef.current);
       restartTimerRef.current = null;
@@ -364,6 +356,9 @@ export function useSpeech(callbacks = {}) {
 
         // If a direct command or wake word matched:
         if (intent) {
+          // Interim speech results are revised multiple times by Chrome and
+          // must not each consume a cloud request.
+          if (!isFinal && !['stop', 'stop_detection'].includes(intent.type)) continue;
           const isDirectAction = [
             'stop_detection',
             'start_detection',
@@ -384,7 +379,7 @@ export function useSpeech(callbacks = {}) {
             // Prevent duplicate rapid re-triggering of the same command on interim & final results
             if (
               lastExecutedCmdRef.current.type === intent.type &&
-              now - lastExecutedCmdRef.current.time < 800
+              now - lastExecutedCmdRef.current.time < 2500
             ) {
               return;
             }
@@ -443,6 +438,7 @@ export function useSpeech(callbacks = {}) {
       setIsListening(false);
 
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        recognitionBlockedRef.current = true;
         setMicNotice('Microphone blocked. Please click the lock/settings icon in the address bar and set Microphone to Allow.');
         return;
       }
@@ -455,9 +451,10 @@ export function useSpeech(callbacks = {}) {
       setIsListening(false);
 
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      if (recognitionBlockedRef.current) return;
       restartTimerRef.current = setTimeout(() => {
         startContinuousRecognition();
-      }, 120);
+      }, 700);
     };
 
     try {
@@ -466,9 +463,10 @@ export function useSpeech(callbacks = {}) {
       isStartingRef.current = false;
       isRecognitionActiveRef.current = false;
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      if (recognitionBlockedRef.current) return;
       restartTimerRef.current = setTimeout(() => {
         startContinuousRecognition();
-      }, 250);
+      }, 1000);
     }
   }, []);
 
@@ -481,6 +479,7 @@ export function useSpeech(callbacks = {}) {
   }, [speak]);
 
   const unlockMic = useCallback(async () => {
+    recognitionBlockedRef.current = false;
     try {
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -494,6 +493,7 @@ export function useSpeech(callbacks = {}) {
 
   // Direct "Listen to User" trigger
   const triggerListenNow = useCallback(() => {
+    recognitionBlockedRef.current = false;
     isListeningPromptRef.current = true;
     if (activeWindowTimerRef.current) clearTimeout(activeWindowTimerRef.current);
     activeWindowTimerRef.current = setTimeout(() => {

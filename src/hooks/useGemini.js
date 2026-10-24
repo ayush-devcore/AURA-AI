@@ -4,7 +4,7 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 
 /**
  * useGemini Hook — Engine B (Cloud / On-Demand)
- * - Triggers gemini-2.5-flash API only on explicit action (hotkey, voice command, or manual tap)
+ * - Calls the server-side Gemini model only on explicit action
  * - Uses compressed 640x480 JPEG 0.6 payload (~40KB) for ultra-low latency (<350ms network turnaround)
  * - Handles currency verification & scene safety analysis for visually impaired users
  */
@@ -85,7 +85,7 @@ export function useGemini() {
           method: 'POST',
           headers,
           body: formData,
-          signal: controller.signal,
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(35000)]),
         });
 
         const data = await response.json().catch(() => ({}));
@@ -115,7 +115,10 @@ export function useGemini() {
         setAnalysisError(errMsg);
         throw err;
       } finally {
-        setIsAnalyzing(false);
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
+          setIsAnalyzing(false);
+        }
       }
     },
     [customApiKey]

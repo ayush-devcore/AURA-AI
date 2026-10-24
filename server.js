@@ -21,21 +21,25 @@ const port = Number(process.env.PORT || 3000);
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const geminiKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
+const openRouterKey = (process.env.OPENROUTER_API_KEY || '').trim();
+const openRouterModel = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-super-vl:free';
 const rawOpenAIKey = (process.env.OPENAI_API_KEY || '').trim();
 const isOpenAI = rawOpenAIKey.startsWith('sk-');
-const openai = isOpenAI ? new OpenAI({ apiKey: rawOpenAIKey, timeout: 30000, maxRetries: 1 }) : null;
+const openai = isOpenAI ? new OpenAI({ apiKey: rawOpenAIKey, timeout: 12000, maxRetries: 0 }) : null;
 
 app.use(express.json());
 
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    configured: Boolean(geminiKey || openai),
+    configured: Boolean(openRouterKey || geminiKey || openai),
     providers: {
+      openrouter: Boolean(openRouterKey),
       gemini: Boolean(geminiKey),
       openai: Boolean(openai),
     },
-    activeProvider: geminiKey ? (openai ? 'gemini+openai' : 'gemini') : (openai ? 'openai' : 'none'),
+    activeProvider: openRouterKey ? 'openrouter' : geminiKey ? (openai ? 'gemini+openai' : 'gemini') : (openai ? 'openai' : 'none'),
+    model: openRouterKey ? openRouterModel : (process.env.GEMINI_MODEL || 'gemini-3.8-flash'),
   });
 });
 
@@ -55,10 +59,10 @@ function buildPrompt(question, mode, userLang) {
   if (isCurrencyMode) {
     if (isHindi) {
       taskInstruction =
-        'आप एक दृष्टिबाधित व्यक्ति के सहायक हैं। छवि की जाँच करें। यदि कोई नोट (currency note/banknote) मौजूद है, तो उसका मूल्य (मूल्यवर्ग), मुद्रा, और वह असली दिखता है या संदिग्ध, स्पष्ट रूप से बताएं। फिर सामने की किसी भी बाधा या सुरक्षा खतरे का वर्णन करें। अपना उत्तर संक्षिप्त, सीधा और अधिकतम 3 सरल वाक्यों में दें।';
+        'आप दृष्टिबाधित उपयोगकर्ता के सहायक हैं। नोट दिखे तो उसका मूल्य और मुद्रा बताएं। केवल तस्वीर देखकर असली होने की पुष्टि न करें; सुरक्षा चिह्न साफ न हों तो कहें कि सत्यापन संभव नहीं है। फिर तुरंत सामने की बाधा या खतरा बताएं। अधिकतम 3 सरल वाक्य।';
     } else {
       taskInstruction =
-        'You are an assistant for a visually impaired user. Examine the image. If a currency note/banknote is present, state its denomination, currency, and whether it appears genuine or suspicious. Then describe any immediate obstacles or safety hazards. Keep your answer brief, direct, and under 3 simple sentences.';
+        'You are a visual assistant for a blind or low-vision user. If a banknote is visible, state its denomination and currency. Do not claim to authenticate it from a photo; say if visible security details look suspicious or cannot be verified. Then mention immediate obstacles or hazards. Use at most 3 short sentences.';
     }
   } else if (mode === 'read') {
     if (isHindi) {
@@ -82,7 +86,7 @@ function buildPrompt(question, mode, userLang) {
         'कार्य: दृष्टिबाधित व्यक्ति के लिए, सीधे सामने क्या है उसका स्पष्ट और सजीव वर्णन करें। तुरंत आने वाली रुकावटों (कुर्सी, दरवाजा, सीढ़ी, व्यक्ति) को प्राथमिकता दें। उत्तर 2 से 3 सरल वाक्यों में दें।';
     } else {
       taskInstruction =
-        'You are an assistant for a visually impaired user. Examine the image. If a currency note/banknote is present, state its denomination, currency, and whether it appears genuine or suspicious. Then describe any immediate obstacles or safety hazards. Keep your answer brief, direct, and under 3 simple sentences.';
+        'You are a visual assistant for a blind or low-vision user. Describe the scene, prioritizing nearby obstacles and hazards. Be direct, state left/center/right only when clear, and use at most 3 short sentences.';
     }
   }
 
@@ -111,20 +115,24 @@ async function callGeminiVision(base64Data, mimeType, prompt, customKey) {
   }
 
   // Active high-speed vision models (fastest lite-first)
-  const models = ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+  // A single supported Flash model prevents a chain of failed model requests
+  // from turning one scan into a multi-minute wait.
+  const models = [process.env.GEMINI_MODEL || 'gemini-3.8-flash'];
   let lastError = null;
 
   for (const model of models) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${activeKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 12000);
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
+      const timeoutId = setTimeout(() => controller.abort(), 18000);
+      let response;
+      let data;
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': activeKey },
+          signal: controller.signal,
+          body: JSON.stringify({
           contents: [{
             parts: [
               { text: prompt },
@@ -132,11 +140,12 @@ async function callGeminiVision(base64Data, mimeType, prompt, customKey) {
             ],
           }],
           generationConfig: { maxOutputTokens: 180, temperature: 0.2 },
-        }),
-      });
-
-      clearTimeout(timeoutId);
-      const data = await response.json();
+          }),
+        });
+        data = await response.json();
+      } finally {
+        clearTimeout(timeoutId);
+      }
       if (response.ok && data.candidates?.[0]?.content?.parts?.[0]?.text) {
         return data.candidates[0].content.parts[0].text.trim();
       }
@@ -151,6 +160,97 @@ async function callGeminiVision(base64Data, mimeType, prompt, customKey) {
   }
 
   throw lastError || new Error('AI vision service unavailable.');
+}
+
+/* ---- OpenRouter Vision (OpenAI-compatible chat completions API) ---- */
+async function callOpenRouterModel(base64Data, mimeType, prompt, model) {
+  if (!openRouterKey) throw new Error('OpenRouter API key is not configured.');
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${openRouterKey}`,
+      'Content-Type': 'application/json',
+      'X-Title': 'AURA AI',
+    },
+    signal: AbortSignal.timeout(20000),
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${base64Data}` } },
+      ] }],
+      max_tokens: 160,
+      temperature: 0.2,
+      // This is a short assistive response. Avoid spending the entire output
+      // budget on hidden reasoning on reasoning-capable vision models.
+      reasoning: { enabled: false },
+      stream: false,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data.error?.message || `OpenRouter returned status ${response.status}.`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.provider = data.error?.metadata?.provider_name || data.error?.provider_name || 'unknown';
+    error.providerCode = data.error?.code || data.error?.metadata?.status || response.status;
+    throw error;
+  }
+  const choice = data.choices?.[0];
+  const message = choice?.message;
+  // OpenAI-compatible APIs may return either a string or typed content blocks.
+  const answer = typeof message?.content === 'string'
+    ? message.content
+    : Array.isArray(message?.content)
+      ? message.content
+          .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+          .map((part) => part.text)
+          .join('\n')
+      : '';
+  if (answer.trim()) return answer.trim();
+
+  // Do not log provider message contents or request/image data. These fields
+  // are enough to diagnose an empty completion without exposing user data.
+  const finishReason = choice?.finish_reason || 'unknown';
+  const diagnostic = [
+    `finish_reason=${finishReason}`,
+    `reasoning=${Boolean(message?.reasoning || message?.reasoning_details?.length)}`,
+    `refusal=${Boolean(message?.refusal)}`,
+    `completion_tokens=${data.usage?.completion_tokens ?? 'unknown'}`,
+    `response_id=${data.id || 'unknown'}`,
+  ].join(', ');
+  console.warn(`[AURA AI] OpenRouter returned no visible text (${diagnostic}).`);
+  const error = new Error(`OpenRouter returned no visible answer (finish reason: ${finishReason}).`);
+  error.status = 502;
+  throw error;
+}
+
+/* Retry transient upstream failures through OpenRouter's image-capable free router. */
+async function callOpenRouterVision(base64Data, mimeType, prompt) {
+  try {
+    return await callOpenRouterModel(base64Data, mimeType, prompt, openRouterModel);
+  } catch (primaryError) {
+    const shouldRetry =
+      openRouterModel !== 'openrouter/free' &&
+      (!primaryError.status || primaryError.status >= 500);
+    if (!shouldRetry) throw primaryError;
+
+    console.warn(
+      `[AURA AI] OpenRouter model ${openRouterModel} failed (provider=${primaryError.provider || 'unknown'}, code=${primaryError.providerCode || primaryError.status || 'network'}); retrying via openrouter/free.`
+    );
+    try {
+      return await callOpenRouterModel(base64Data, mimeType, prompt, 'openrouter/free');
+    } catch (fallbackError) {
+      console.warn(
+        `[AURA AI] OpenRouter free-router fallback failed (provider=${fallbackError.provider || 'unknown'}, code=${fallbackError.providerCode || fallbackError.status || 'network'}): ${fallbackError.message}`
+      );
+      // Preserve the primary error because it identifies the configured model
+      // failure; report the fallback failure as context without request data.
+      const error = new Error(`${primaryError.message}; free-router fallback: ${fallbackError.message}`);
+      error.status = fallbackError.status || primaryError.status || 502;
+      throw error;
+    }
+  }
 }
 
 /* ---- Unified Vision & Analysis Handler ---- */
@@ -189,22 +289,32 @@ async function handleVisionRequest(req, res, next) {
     const userLang = req.body.language || 'en';
     const prompt = buildPrompt(question, mode, userLang);
 
-    // AI Vision Pipeline: Dual-Engine with Automatic Failover (Gemini + OpenAI)
+    // Prefer OpenRouter when configured, then keep the existing Gemini/OpenAI fallback.
     let answer = null;
     let primaryErr = null;
 
     const isCustomOpenAI = typeof customKey === 'string' && customKey.trim().startsWith('sk-');
     const activeOpenAI = isCustomOpenAI
-      ? new OpenAI({ apiKey: customKey.trim(), timeout: 25000, maxRetries: 1 })
+      ? new OpenAI({ apiKey: customKey.trim(), timeout: 12000, maxRetries: 0 })
       : openai;
 
-    // 1. Google Gemini (fast-first cloud engine if not explicitly an OpenAI key)
-    if (!isCustomOpenAI && (customKey || geminiKey)) {
+    if (openRouterKey) {
+      try {
+        answer = await callOpenRouterVision(base64Data, mimeType, prompt);
+      } catch (openRouterErr) {
+        primaryErr = openRouterErr;
+        console.warn('[AURA AI] OpenRouter notice:', openRouterErr.message);
+      }
+    }
+
+    // 1. Google Gemini fallback (skip when the request explicitly carries an OpenAI key)
+    if (!answer && !isCustomOpenAI && (customKey || geminiKey)) {
       try {
         answer = await callGeminiVision(base64Data, mimeType, prompt, customKey);
       } catch (geminiErr) {
         primaryErr = geminiErr;
-        console.warn('[AURA AI] Gemini vision notice:', geminiErr.message, '— falling back to OpenAI.');
+        if (!primaryErr) primaryErr = geminiErr;
+        console.warn('[AURA AI] Gemini vision notice:', geminiErr.message);
       }
     }
 
@@ -212,8 +322,10 @@ async function handleVisionRequest(req, res, next) {
     if (!answer && activeOpenAI) {
       try {
         const imageUri = `data:${mimeType};base64,${base64Data}`;
+        const configuredModel = process.env.OPENAI_VISION_MODEL || '';
+        const model = /^gpt-[a-z0-9.-]+$/i.test(configuredModel) ? configuredModel : 'gpt-4o-mini';
         const result = await activeOpenAI.chat.completions.create({
-          model: process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini',
+          model,
           max_tokens: 160,
           messages: [{
             role: 'user',
@@ -292,7 +404,7 @@ app.use((error, _req, res, _next) => {
   }
 
   console.error('Vision request failed:', error.message);
-  res.status(500).json({ error: error.message || 'Could not analyze image.' });
+  res.status(status >= 500 && status <= 599 ? status : 500).json({ error: error.message || 'Could not analyze image.' });
 });
 
 import fs from 'node:fs';
@@ -309,7 +421,9 @@ if (fs.existsSync(distPath)) {
 }
 
 app.listen(port, () => {
-  const activeProviders = [geminiKey && 'Google Gemini', openai && 'OpenAI (gpt-4o-mini)'].filter(Boolean);
+  const activeProviders = [openRouterKey && 'OpenRouter', geminiKey && 'Google Gemini', openai && 'OpenAI (gpt-4o-mini)'].filter(Boolean);
   console.log(`AURA AI backend listening on http://localhost:${port}`);
+  if (openRouterKey) console.log(`OpenRouter model: ${openRouterModel}`);
+  else console.log(`Gemini model: ${process.env.GEMINI_MODEL || 'gemini-3.8-flash'}`);
   console.log(`AI active providers: ${activeProviders.join(' + ') || 'None'}`);
 });

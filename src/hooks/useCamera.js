@@ -98,12 +98,25 @@ export function useCamera() {
     offscreenCanvas.width = targetWidth;
     offscreenCanvas.height = targetHeight;
     const ctx = offscreenCanvas.getContext('2d');
+    if (!ctx) throw new Error('Could not prepare a camera snapshot.');
 
     // Maintain aspect ratio or center-crop
     const videoWidth = video.videoWidth || targetWidth;
     const videoHeight = video.videoHeight || targetHeight;
-
-    ctx.drawImage(video, 0, 0, videoWidth, videoHeight, 0, 0, targetWidth, targetHeight);
+    const sourceRatio = videoWidth / videoHeight;
+    const targetRatio = targetWidth / targetHeight;
+    let sx = 0;
+    let sy = 0;
+    let sourceWidth = videoWidth;
+    let sourceHeight = videoHeight;
+    if (sourceRatio > targetRatio) {
+      sourceWidth = videoHeight * targetRatio;
+      sx = (videoWidth - sourceWidth) / 2;
+    } else {
+      sourceHeight = videoWidth / targetRatio;
+      sy = (videoHeight - sourceHeight) / 2;
+    }
+    ctx.drawImage(video, sx, sy, sourceWidth, sourceHeight, 0, 0, targetWidth, targetHeight);
 
     // Generate JPEG with quality 0.6
     const blob = await new Promise((resolve) => {
@@ -114,10 +127,9 @@ export function useCamera() {
       throw new Error('Failed to capture frame from camera.');
     }
 
-    const dataUrl = offscreenCanvas.toDataURL('image/jpeg', 0.6);
-    const base64 = dataUrl.split(',')[1];
-
-    return { blob, base64, dataUrl, sizeBytes: blob.size };
+    // The API accepts the JPEG blob directly. Avoid a second full encode and
+    // base64 allocation on the main thread for every scan.
+    return { blob, sizeBytes: blob.size };
   }, []);
 
   // Cleanup on unmount

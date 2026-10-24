@@ -1,6 +1,4 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import * as tf from '@tensorflow/tfjs';
-import * as cocoSsd from '@tensorflow-models/coco-ssd';
 
 /**
  * Complete MS-COCO 80-Class dictionary with natural bilingual voice warnings
@@ -109,6 +107,15 @@ export const OBSTACLE_VOCAB = {
   obstacle: { en: 'obstacle', hi: 'रुकावट', type: 'hazard' },
 };
 
+// COCO-SSD recognizes common objects, not every real-world hazard. Keep the
+// alert path focused on objects a user could collide with or should notice.
+const OBSTACLE_CLASSES = new Set([
+  'person', 'bicycle', 'car', 'motorcycle', 'bus', 'train', 'truck',
+  'bench', 'backpack', 'umbrella', 'handbag', 'suitcase', 'skateboard',
+  'dog', 'cat', 'horse', 'cow', 'chair', 'couch', 'bed', 'dining table',
+  'toilet', 'potted plant', 'bottle', 'knife', 'scissors',
+]);
+
 /**
  * Formats high-clarity natural spoken obstacle warning
  * Prioritizes pedestrians, cars, vehicles, and direct path hazards
@@ -163,6 +170,9 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
   const lastBeepTimeRef = useRef(0);
   const lastVibrateTimeRef = useRef(0);
   const isDetectingRef = useRef(false);
+  const smoothedClosenessRef = useRef(0);
+  const lastThreatRef = useRef(null);
+  const lastThreatSeenAtRef = useRef(0);
 
   // Throttling state for spoken warnings
   const lastSpokenObstacleRef = useRef({
@@ -313,6 +323,13 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
         setIsModelLoading(true);
         setModelError(null);
 
+        // Keep the large detector out of the first page download. Load it when
+        // the app starts its local vision engine.
+        const [tf, cocoSsd] = await Promise.all([
+          import('@tensorflow/tfjs'),
+          import('@tensorflow-models/coco-ssd'),
+        ]);
+
         try {
           await tf.setBackend('webgl').catch(async () => {
             console.warn('WebGL backend unavailable, using CPU.');
@@ -325,7 +342,9 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
         await tf.ready();
         console.log(`[AURA AI] TensorFlow.js backend: ${tf.getBackend()}`);
 
-        const model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+        // The full MobileNet V2 backbone improves recognition over the lite
+        // model, at the cost of a larger download and slower inference.
+        const model = await cocoSsd.load({ base: 'mobilenet_v2' });
         if (isMounted) {
           modelRef.current = model;
           setIsModelReady(true);
@@ -359,7 +378,9 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
 
     let isRunning = true;
     let lastFrameTime = 0;
-    const targetInterval = 1000 / 25; // 25 FPS for smooth radar tracking
+    // COCO-SSD inference is not guaranteed to finish at camera frame rate;
+    // process the newest frame as soon as the previous inference completes.
+    const targetInterval = 1000 / 30;
 
     async function detectFrame(timestamp) {
       if (!isRunning) return;
@@ -382,8 +403,9 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
         isDetectingRef.current = true;
 
         try {
-          // Detect up to 10 objects with high sensitivity threshold (0.18)
-          const predictions = await modelRef.current.detect(video, 10, 0.18);
+          // A slightly higher confidence threshold reduces false alarms. Keep
+          // enough candidates so a busy frame does not hide a nearby object.
+          const predictions = await modelRef.current.detect(video, 20, 0.25);
           const frameWidth = video.videoWidth || 640;
           const frameHeight = video.videoHeight || 480;
           const frameArea = frameWidth * frameHeight;
@@ -391,10 +413,13 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
           let highestThreat = null;
           let maxThreatScore = 0;
 
-          if (predictions && predictions.length > 0) {
-            setDetectedCount(predictions.length);
+          const obstacles = (predictions || []).filter(
+            (prediction) => OBSTACLE_CLASSES.has(prediction.class)
+          );
+          if (obstacles.length > 0) {
+            setDetectedCount(obstacles.length);
 
-            for (const pred of predictions) {
+            for (const pred of obstacles) {
               const [x, y, w, h] = pred.bbox;
               const boxArea = w * h;
               const areaRatio = boxArea / frameArea;
@@ -468,23 +493,42 @@ export function useTensorflow(videoRef, isCameraActive, options = {}) {
           }
 
           const now = Date.now();
+          // Hold a just-seen object briefly when one inference frame misses it.
+          // This prevents the sonar from cutting in and out on borderline boxes.
+          let beepThreat = highestThreat;
+          if (highestThreat) {
+            lastThreatRef.current = highestThreat;
+            lastThreatSeenAtRef.current = now;
+          } else if (lastThreatRef.current && now - lastThreatSeenAtRef.current < 260) {
+            beepThreat = lastThreatRef.current;
+          } else {
+            lastThreatRef.current = null;
+            smoothedClosenessRef.current = 0;
+          }
 
           // 1. Dynamic Sonar Proximity Beeps according to distance of closer object
           // Runs continuously whenever detection is active — no delay!
-          if (highestThreat && !isMutedRef.current && !isPausedRef.current && isDetectionActiveRef.current) {
-            let rawCloseness = (highestThreat.areaRatio - 0.004) / 0.16;
-            if (highestThreat.isPerson) {
-              rawCloseness = Math.max(rawCloseness, (highestThreat.heightRatio - 0.18) / 0.45);
-            } else if (highestThreat.isVehicle) {
-              rawCloseness = Math.max(rawCloseness, (highestThreat.widthRatio - 0.18) / 0.45);
+          if (beepThreat && !isMutedRef.current && !isPausedRef.current && isDetectionActiveRef.current) {
+            let rawCloseness = (beepThreat.areaRatio - 0.004) / 0.16;
+            if (beepThreat.isPerson) {
+              rawCloseness = Math.max(rawCloseness, (beepThreat.heightRatio - 0.18) / 0.45);
+            } else if (beepThreat.isVehicle) {
+              rawCloseness = Math.max(rawCloseness, (beepThreat.widthRatio - 0.18) / 0.45);
             }
-            const closeness = Math.min(1, Math.max(0, rawCloseness));
+            const targetCloseness = Math.min(1, Math.max(0, rawCloseness));
+            // Rise quickly for safety; ease down more gradually so small box
+            // fluctuations do not make the beep intensity pulse erratically.
+            const smoothing = targetCloseness > smoothedClosenessRef.current ? 0.72 : 0.32;
+            smoothedClosenessRef.current +=
+              (targetCloseness - smoothedClosenessRef.current) * smoothing;
+            const closeness = smoothedClosenessRef.current;
 
-            // Intensity (Volume): Scales dynamically from 0.08 (quiet distant ping) up to 0.40 (loud piercing urgent alert)
-            const beepVolume = 0.08 + closeness * 0.32;
+            // Perceived loudness rises with apparent object size. Keep a safe
+            // ceiling; device/browser volume controls the actual output level.
+            const beepVolume = 0.07 + closeness * 0.48;
 
-            // Interval (Tempo): Scales from 900ms (far away relaxed tempo) down to 110ms (rapid-fire continuous alert)
-            const beepIntervalMs = Math.round(900 - closeness * 790);
+            // Slow distant pings accelerate sharply for a large, near object.
+            const beepIntervalMs = Math.round(1100 - closeness * 930);
 
             // Pitch (Frequency): Scales from 380Hz (deep calm pulse) up to 1060Hz (sharp piercing alarm)
             const beepFrequency = Math.round(380 + closeness * 680);
